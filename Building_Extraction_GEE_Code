@@ -1,0 +1,219 @@
+// A simple tool to find and export building footprints from satellite data.
+// It's like a smart search for buildings!
+
+// Configuration settings, feel free to tweak these.
+var OPEN_BUILDINGS = 'GOOGLE/Research/open-buildings/v3/polygons';
+var EXPORT_FOLDER = 'My_Building_Footprints';
+var MIN_CONFIDENCE = 0.5; // How sure the model has to be that it's a building.
+var MIN_AREA = 6; // Smallest building area to include (in square meters).
+
+// Let's set up the user interface.
+var sidePanel = ui.Panel({
+  style: {
+    width: '400px',
+    padding: '10px'
+  }
+});
+ui.root.insert(0, sidePanel);
+
+// A nice, friendly title.
+sidePanel.add(ui.Label('Building Footprint Finder', {
+  fontSize: '18px',
+  fontWeight: 'bold',
+  margin: '0 0 10px 0'
+}));
+
+// Quick instructions for a new user.
+sidePanel.add(ui.Label('Hey there! Just follow these steps:', {margin: '0 0 5px 0'}));
+sidePanel.add(ui.Label('1. Draw a shape on the map to define your search area.', {margin: '0 0 5px 0'}));
+sidePanel.add(ui.Label('2. Tweak the filters on the left if you want.', {margin: '0 0 5px 0'}));
+sidePanel.add(ui.Label('3. Click the "Extract Buildings" button below!', {margin: '0 0 15px 0'}));
+
+// Buttons to control the drawing.
+var startDrawButton = ui.Button({
+  label: 'Start Drawing',
+  onClick: function() {
+    drawingTools.setShape('polygon');
+    drawingTools.draw();
+    statusLabel.setValue('Status: Drawing... Get creative with your shape!');
+  }
+});
+
+var clearAoiButton = ui.Button({
+  label: 'Clear Boundary',
+  onClick: function() {
+    // Just remove the drawn polygon layer.
+    if (drawingTools.layers().length() > 0) {
+      drawingTools.layers().remove(drawingTools.layers().get(0));
+    }
+    statusLabel.setValue('Status: Boundary cleared.');
+  }
+});
+
+var resetButton = ui.Button({
+  label: 'Reset All',
+  onClick: function() {
+    // This function cleans up everything and gets you back to the start.
+    resetAll();
+    statusLabel.setValue('Status: Everything reset.');
+  }
+});
+
+sidePanel.add(ui.Panel([startDrawButton, clearAoiButton, resetButton], ui.Panel.Layout.flow('horizontal')));
+
+// Let's add some simple sliders for the filters.
+sidePanel.add(ui.Label('Filters:', {fontWeight: 'bold', margin: '10px 0 5px 0'}));
+
+var confSlider = ui.Slider({
+  min: 0.0, 
+  max: 1.0, 
+  value: MIN_CONFIDENCE, 
+  step: 0.01,
+  style: {width: '300px'}
+});
+sidePanel.add(ui.Panel([ui.Label('Min Confidence:'), confSlider], ui.Panel.Layout.flow('horizontal')));
+
+var areaSlider = ui.Slider({
+  min: 0, 
+  max: 50, 
+  value: MIN_AREA, 
+  step: 1,
+  style: {width: '300px'}
+});
+sidePanel.add(ui.Panel([ui.Label('Min Area (m²):'), areaSlider], ui.Panel.Layout.flow('horizontal')));
+
+// The main action buttons.
+var extractButton = ui.Button({
+  label: 'Extract Buildings',
+  onClick: findBuildings,
+  disabled: true,
+  style: {stretch: 'horizontal'}
+});
+sidePanel.add(extractButton);
+
+var exportButton = ui.Button({
+  label: 'Export to My Drive',
+  onClick: exportToDrive,
+  disabled: true,
+  style: {stretch: 'horizontal'}
+});
+sidePanel.add(exportButton);
+
+// A little status message to keep you in the loop.
+var statusLabel = ui.Label('Status: Ready to start. Draw a boundary on the map!', {margin: '10px 0 0 0'});
+sidePanel.add(statusLabel);
+
+// Initialize the map and drawing tools.
+Map.setOptions('SATELLITE');
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(true);
+
+// Global variables to hold our data.
+var drawnArea = null;
+var foundBuildings = null;
+
+// This function gets called once the user finishes drawing their shape.
+drawingTools.onDraw(function(geometry) {
+  drawnArea = geometry;
+  statusLabel.setValue('Status: Area drawn! Now click "Extract Buildings".');
+  extractButton.setDisabled(false);
+  exportButton.setDisabled(true);
+});
+
+// A function to reset everything.
+function resetAll() {
+  // Clear the drawn layer.
+  var layers = drawingTools.layers();
+  while (layers.length() > 0) {
+    drawingTools.layers().remove(layers.get(0));
+  }
+  
+  // Clear the map layers for the buildings.
+  Map.layers().reset();
+  
+  // Reset our variables and button states.
+  drawnArea = null;
+  foundBuildings = null;
+  extractButton.setDisabled(true);
+  exportButton.setDisabled(true);
+}
+
+// Function to actually find the buildings.
+function findBuildings() {
+  if (!drawnArea) {
+    statusLabel.setValue('Status: Oops. You need to draw an area first.');
+    return;
+  }
+  
+  statusLabel.setValue('Status: Searching for buildings...');
+  
+  var minConf = confSlider.getValue();
+  var minArea = areaSlider.getValue();
+  
+  // Grab the buildings from the dataset and filter them.
+  var buildings = ee.FeatureCollection(OPEN_BUILDINGS)
+    .filterBounds(drawnArea)
+    .filter(ee.Filter.gte('confidence', minConf));
+  
+  // Clean up the features: clip to the drawn area and calculate the actual area.
+  var clippedAndFiltered = buildings.map(function(feature) {
+    var geometry = feature.geometry().intersection(drawnArea, ee.ErrorMargin(1));
+    var area = geometry.area(1);
+    return ee.Feature(geometry)
+      .set('area_m2', area)
+      .copyProperties(feature, ['confidence']);
+  }).filter(ee.Filter.gte('area_m2', minArea));
+  
+  // Sort the buildings so they have a nice, logical order.
+  var sorted = clippedAndFiltered.map(function(feature) {
+    var centroid = feature.geometry().centroid(1).coordinates();
+    return feature.set({
+      'sort_x': centroid.get(0),
+      'sort_y': centroid.get(1)
+    });
+  }).sort('sort_y').sort('sort_x');
+  
+  // Give each building a unique ID.
+  var sequence = ee.List.sequence(1, sorted.size());
+  var finalFeatures = ee.FeatureCollection(sequence.map(function(i) {
+    i = ee.Number(i);
+    var feature = ee.Feature(sorted.toList(sorted.size()).get(i.subtract(1)));
+    return feature
+      .set('UID', i)
+      .select(['UID', 'confidence', 'area_m2']); // Just keep the useful stuff.
+  }));
+  
+  // Save the final result and show it on the map.
+  foundBuildings = finalFeatures;
+  Map.layers().set(1, ui.Map.Layer(drawnArea, {color: 'FF0000'}, 'Your Drawn Area', true));
+  Map.layers().set(2, ui.Map.Layer(foundBuildings, {color: '00FF00'}, 'Found Buildings', true));
+  
+  // Update the status and enable the export button.
+  exportButton.setDisabled(false);
+  foundBuildings.size().evaluate(function(count) {
+    statusLabel.setValue('Status: Found ' + count + ' buildings! Ready to export.');
+  });
+}
+
+// Function to send the data to your Google Drive.
+function exportToDrive() {
+  if (!foundBuildings) {
+    statusLabel.setValue('Status: Oops. Nothing to export! Find some buildings first.');
+    return;
+  }
+  
+  // Make a unique filename with a timestamp.
+  var timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  var description = 'building_footprints_' + timestamp;
+  
+  // This is the command that starts the export process.
+  Export.table.toDrive({
+    collection: foundBuildings,
+    description: description,
+    folder: EXPORT_FOLDER,
+    fileFormat: 'SHP',
+    selectors: ['UID', 'confidence', 'area_m2']
+  });
+  
+  statusLabel.setValue('Status: Export started! Check your Google Earth Engine "Tasks" tab for progress.');
+}
